@@ -35,6 +35,11 @@ LIMIT_RE = re.compile(
     re.IGNORECASE,
 )
 
+FILTER_HINT_RE = re.compile(
+    r"\b(over|under|above|below|less than|more than|with|where|buyer|from|located|state|total|item|items)\b",
+    re.IGNORECASE,
+)
+
 SYSTEM_PROMPT = """
                 You extract relevant order records from an unstructured order dataset.
 
@@ -49,6 +54,7 @@ SYSTEM_PROMPT = """
 
                 Rules:
                 - Interpret the latest user request using the recent conversation.
+                - If an order number appears in the source text, orderId must be populated with that number as a string.
                 - Return only records relevant to the user's request.
                 - Return only the amount of records that the user requests. Do not return more or less.
                 - Use only facts supported by the raw source.
@@ -103,9 +109,11 @@ llm = ChatOpenAI(
     api_key=os.environ["OPENROUTER_API_KEY"],
     base_url=os.getenv("OPENROUTER_BASE", "https://openrouter.ai/api/v1"),
     temperature=0,
+    timeout=60,
+    max_retries=3,
 )
 
-structured_llm = llm.with_structured_output(ExtractedOrders)
+structured_llm = llm.with_structured_output(ExtractedOrders, method="json_mode")
 
 def get_latest_human_message(state: AgentState) -> HumanMessage:
     for message in reversed(state["messages"]):
@@ -122,6 +130,10 @@ def find_requested_limit(text: str) -> int | None:
     m = LIMIT_RE.search(text)
     return int(m.group(1)) if m else None
 
+def find_filter_hint(text: str) -> str | None:
+    m = FILTER_HINT_RE.search(text)
+    return m.group(1) if m else None
+
 def fetch_raw_data_and_clean(state: AgentState) -> dict[str, Any]:
     message = get_latest_human_message(state).content
     order_id = find_order_id(message)
@@ -132,9 +144,13 @@ def fetch_raw_data_and_clean(state: AgentState) -> dict[str, Any]:
     else:
         url = ORDERS_ENDPOINT
         limit = find_requested_limit(message)
-        params = {"limit": limit} if limit is not None else None
+        filter_hint = find_filter_hint(message)
+        if limit is not None and not filter_hint:
+            params = {"limit": limit}
+        else:
+            params = None
 
-    logger.info("Fetching order data")
+    logger.info("Fetching order data: url=%s : params=%s", url, params)
 
     try:
         response = requests.get(
@@ -155,26 +171,30 @@ def fetch_raw_data_and_clean(state: AgentState) -> dict[str, Any]:
 def extract_records(state: AgentState) -> dict[str, Any]:
     message = get_latest_human_message(state).content
 
-    logger.info("Extracting records with LLM")
+    logger.info("Extracting records with LLM request: %s, data: %s...", message, state['cleaned_data'][:20])
 
     try:
         result = structured_llm.invoke([
             SystemMessage(content=SYSTEM_PROMPT),
             HumanMessage(content=f"USER REQUEST: {message}\n\nDATA:\n{state['cleaned_data']}"),
         ])
+
+        logger.info("LLM returned structured result")
     except Exception as e:
         logger.exception("LLM extraction failed with: %s", e)
+        return {"records" : []}
+    
     records = [r.model_dump() for r in result.records]
 
     logger.info("LLM extraction complete")
     
-    return {"records": [r.model_dump() for r in result.records]}
+    return {"records": records}
 
 
 def finalize_records(state: AgentState) -> dict[str, Any]:
     records = state.get("records", [])
     response_payload = {"records": records}
-
+    
     return {
         "records": records,
         "messages": [
